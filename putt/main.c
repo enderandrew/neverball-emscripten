@@ -14,6 +14,10 @@
 
 /*---------------------------------------------------------------------------*/
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/html5.h>
+#endif					 
 #include <SDL.h>
 #include <time.h>
 #include <stdio.h>
@@ -28,7 +32,9 @@
 #include "state.h"
 #include "config.h"
 #include "video.h"
+#include "text.h"
 #include "mtrl.h"
+#include "geom.h"
 #include "course.h"
 #include "hole.h"
 #include "game.h"
@@ -40,6 +46,8 @@
 
 #include "st_conf.h"
 #include "st_all.h"
+
+int camera = 0;
 
 const char TITLE[] = "Neverputt";
 const char ICON[] = "icon/neverputt.png";
@@ -77,6 +85,156 @@ static void toggle_wire(void)
 
 /*---------------------------------------------------------------------------*/
 
+/*
+ * Track held direction keys.
+ */
+static char key_pressed[4];
+
+static const int key_other[4] = { 1, 0, 3, 2 };
+
+static const int *key_axis[4] = {
+    &CONFIG_JOYSTICK_AXIS_Y0,
+    &CONFIG_JOYSTICK_AXIS_Y0,
+    &CONFIG_JOYSTICK_AXIS_X0,
+    &CONFIG_JOYSTICK_AXIS_X0
+};
+
+static const float key_tilt[4] = { -1.0f, +1.0f, -1.0f, +1.0f };
+
+static int handle_key_dn(SDL_Event *e)
+{
+    int d = 1;
+    int c = e->key.keysym.sym;
+
+    int dir = -1;
+
+    /* SDL made me do it. */
+#ifdef __APPLE__
+    if (c == SDLK_q && e->key.keysym.mod & KMOD_GUI)
+        return 0;
+#endif
+#ifdef _WIN32
+    if (c == SDLK_F4 && e->key.keysym.mod & KMOD_ALT)
+        return 0;
+#endif
+
+    switch (c)
+    {
+    case KEY_SCREENSHOT:
+        shot();
+        break;
+    case KEY_FPS:
+        config_tgl_d(CONFIG_FPS);
+        break;
+    case KEY_WIREFRAME:
+        if (config_cheat())
+            toggle_wire();
+        break;
+    case KEY_RESOURCES:
+        if (config_cheat())
+        {
+            light_load();
+            mtrl_reload();
+        }
+        break;
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:
+        d = st_buttn(config_get_d(CONFIG_JOYSTICK_BUTTON_A), 1);
+        break;
+    case KEY_FULLSCREEN:
+        video_fullscreen(!config_get_d(CONFIG_FULLSCREEN));
+        break;
+    case KEY_EXIT:
+        d = st_keybd(KEY_EXIT, 1);
+        break;
+
+    default:
+        if (config_tst_d(CONFIG_KEY_FORWARD,  c))
+            dir = 0;
+        else if (config_tst_d(CONFIG_KEY_BACKWARD, c))
+            dir = 1;
+        else if (config_tst_d(CONFIG_KEY_LEFT, c))
+            dir = 2;
+        else if (config_tst_d(CONFIG_KEY_RIGHT, c))
+            dir = 3;
+
+        if (dir != -1)
+        {
+            /* Ignore auto-repeat on direction keys. */
+
+            if (e->key.repeat)
+                break;
+
+            key_pressed[dir] = 1;
+            st_stick(config_get_d(*key_axis[dir]), key_tilt[dir]);
+        }
+        else
+            d = st_keybd(e->key.keysym.sym, 1);
+    }
+
+    return d;
+}
+
+static int handle_key_up(SDL_Event *e)
+{
+    int d = 1;
+    int c = e->key.keysym.sym;
+
+    int dir = -1;
+
+    switch (c)
+    {
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:
+        d = st_buttn(config_get_d(CONFIG_JOYSTICK_BUTTON_A), 0);
+        break;
+    case KEY_EXIT:
+        d = st_keybd(KEY_EXIT, 0);
+        break;
+    default:
+        if (config_tst_d(CONFIG_KEY_FORWARD, c))
+            dir = 0;
+        else if (config_tst_d(CONFIG_KEY_BACKWARD, c))
+            dir = 1;
+        else if (config_tst_d(CONFIG_KEY_LEFT, c))
+            dir = 2;
+        else if (config_tst_d(CONFIG_KEY_RIGHT, c))
+            dir = 3;
+
+        if (dir != -1)
+        {
+            key_pressed[dir] = 0;
+
+            if (key_pressed[key_other[dir]])
+                st_stick(config_get_d(*key_axis[dir]), -key_tilt[dir]);
+            else
+                st_stick(config_get_d(*key_axis[dir]), 0.0f);
+        }
+        else
+            d = st_keybd(e->key.keysym.sym, 0);
+    }
+
+    return d;
+}
+
+#ifdef __EMSCRIPTEN__
+
+enum {
+    USER_EVENT_BACK = -1,
+    USER_EVENT_PAUSE = 0
+};
+
+void push_user_event(int code)
+{
+    SDL_Event event = { SDL_USEREVENT };
+    event.user.code = code;
+    SDL_PushEvent(&event);
+}
+#endif
+
+
+/*---------------------------------------------------------------------------*/
+
 static int loop(void)
 {
     SDL_Event e;
@@ -84,14 +242,54 @@ static int loop(void)
     int c;
 
     int ax, ay, dx, dy;
+	
+#ifdef __EMSCRIPTEN__
+    /* Since we are in the browser, and want to look good on every device,
+     * naturally, we use CSS to do layout. The canvas element has two sizes:
+     * the layout size ("window") and the drawing buffer size ("resolution").
+     * Here, we get the canvas layout size and set the canvas resolution
+     * to match. To update a bunch of internal state, we use SDL_SetWindowSize
+     * to set the canvas resolution.
+     */
+
+    double clientWidth, clientHeight;
+
+    int w, h;
+
+    emscripten_get_element_css_size("#canvas", &clientWidth, &clientHeight);
+
+    w = (int) clientWidth;
+    h = (int) clientHeight;
+
+    if (w != video.window_w || h != video.window_h)
+        video_set_window_size(w, h);
+#endif
+
+    /* Process SDL events. */
 
     while (d && SDL_PollEvent(&e))
     {
-        if (e.type == SDL_QUIT)
-            return 0;
-
         switch (e.type)
         {
+        case SDL_QUIT:
+            return 0;
+
+#ifdef __EMSCRIPTEN__
+        case SDL_USEREVENT:
+            switch (e.user.code)
+            {
+                case USER_EVENT_BACK:
+                    d = st_keybd(KEY_EXIT, 1);
+                    break;
+
+                case USER_EVENT_PAUSE:
+                    if (video_get_grab())
+                        goto_state(&st_pause);
+                    break;
+            }
+            break;
+#endif
+
         case SDL_MOUSEMOTION:
             /* Convert to OpenGL coordinates. */
 
@@ -119,63 +317,15 @@ static int loop(void)
             d = st_click(e.button.button, 0);
             break;
 
+        case SDL_FINGERDOWN:
+        case SDL_FINGERUP:
+        case SDL_FINGERMOTION:
+            d = st_touch(&e.tfinger);
+            break;
+
         case SDL_KEYDOWN:
 
             c = e.key.keysym.sym;
-
-#ifdef __APPLE__
-            if (c == SDLK_q && e.key.keysym.mod & KMOD_GUI)
-            {
-                d = 0;
-                break;
-            }
-#endif
-#ifdef _WIN32
-            if (c == SDLK_F4 && e.key.keysym.mod & KMOD_ALT)
-            {
-                d = 0;
-                break;
-            }
-#endif
-
-            switch (c)
-            {
-            case KEY_SCREENSHOT:
-                shot();
-                break;
-            case KEY_FPS:
-                config_tgl_d(CONFIG_FPS);
-                break;
-            case KEY_WIREFRAME:
-                toggle_wire();
-                break;
-            case KEY_FULLSCREEN:
-                video_fullscreen(!config_get_d(CONFIG_FULLSCREEN));
-                break;
-            case SDLK_RETURN:
-            case SDLK_KP_ENTER:
-                d = st_buttn(config_get_d(CONFIG_JOYSTICK_BUTTON_A), 1);
-                break;
-            case SDLK_ESCAPE:
-                if (video_get_grab())
-                    d = st_buttn(config_get_d(CONFIG_JOYSTICK_BUTTON_START), 1);
-                else
-                    d = st_buttn(config_get_d(CONFIG_JOYSTICK_BUTTON_B), 1);
-                break;
-
-            default:
-                if (config_tst_d(CONFIG_KEY_FORWARD, c))
-                    st_stick(config_get_d(CONFIG_JOYSTICK_AXIS_Y0), -1.0f);
-                else if (config_tst_d(CONFIG_KEY_BACKWARD, c))
-                    st_stick(config_get_d(CONFIG_JOYSTICK_AXIS_Y0), +1.0f);
-                else if (config_tst_d(CONFIG_KEY_LEFT, c))
-                    st_stick(config_get_d(CONFIG_JOYSTICK_AXIS_X0), -1.0f);
-                else if (config_tst_d(CONFIG_KEY_RIGHT, c))
-                    st_stick(config_get_d(CONFIG_JOYSTICK_AXIS_X0), +1.0f);
-                else
-                    d = st_keybd(e.key.keysym.sym, 1);
-            }
-            break;
 
         case SDL_KEYUP:
 
@@ -228,6 +378,10 @@ static int loop(void)
             }
             break;
 
+        case SDL_TEXTINPUT:
+            text_input_str(e.text.text, 1);
+            break;
+
         case SDL_JOYAXISMOTION:
             joy_axis(e.jaxis.which, e.jaxis.axis, JOY_VALUE(e.jaxis.value));
             break;
@@ -247,8 +401,13 @@ static int loop(void)
         case SDL_JOYDEVICEREMOVED:
             joy_remove(e.jdevice.which);
             break;
+
+        case SDL_MOUSEWHEEL:
+            st_wheel(e.wheel.x, e.wheel.y);
+            break;
         }
     }
+
     return d;
 }
 
@@ -294,10 +453,63 @@ static void opt_parse(int argc, char **argv)
 
 /*---------------------------------------------------------------------------*/
 
-int main(int argc, char *argv[])
-{
-    int camera = 0;
+static void main_quit(void);
 
+struct main_loop
+{
+    Uint32 now;
+    unsigned int done:1;
+};
+
+static void step(void *data)
+{
+    struct main_loop *mainloop = (struct main_loop *) data;
+
+    int running = loop();
+
+    if (running)
+    {
+        Uint32 now = SDL_GetTicks();
+        Uint32 dt = (now - mainloop->now);
+
+        if (0 < dt && dt < 1000)
+        {
+            /* Step the game state. */
+
+            st_timer(0.001f * dt);
+
+            /* Render. */
+
+            hmd_step();
+            st_paint(0.001f * now);
+            video_swap();
+        }
+
+        mainloop->now = now;
+    }
+
+    mainloop->done = !running;
+
+#ifdef __EMSCRIPTEN__
+    /* On Emscripten, we never return to main(), so we have to do shutdown here. */
+
+    if (mainloop->done)
+    {
+        emscripten_cancel_main_loop();
+        main_quit();
+
+        EM_ASM({
+            Neverputt.quit();
+        });
+    }
+#endif
+}
+
+/*
+ * Initialize all systems.
+ */
+static int main_init(int argc, char *argv[])
+{
     if (!fs_init(argc > 0 ? argv[0] : NULL))
     {
         fprintf(stderr, "Failure to initialize virtual file system (%s)\n",
@@ -313,93 +525,139 @@ int main(int argc, char *argv[])
     log_init("Neverputt" VERSION, "neverputt.log");
     fs_mkdir("Screenshots");
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) == 0)
+    /* Initialize SDL. */
+
+#ifdef SDL_HINT_TOUCH_MOUSE_EVENTS
+    SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+#endif
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) == -1)
     {
-        joy_init();
+        log_printf("Failure to initialize SDL (%s)\n", SDL_GetError());
+        return 0;
+    }
 
-        config_init();
-        config_load();
+    /* Enable joystick events. */
 
-        /* Initialize localization. */
+    joy_init();
 
-        lang_init();
+    /* Intitialize configuration. */
 
-        /* Cache Neverball's camera setting. */
+    config_init();
+    config_load();
 
-        camera = config_get_d(CONFIG_CAMERA);
+    /* Initialize localization. */
 
-        /* Initialize the audio. */
+    lang_init();
+	
+    /* Cache Neverputt's camera setting. */
+	
+    camera = config_get_d(CONFIG_CAMERA);
+	
+    /* Initialize the audio. */
+	
+    audio_init();
+	
+    /* Initialize the video. */
+    if (!video_init())
+        return 0;
 
-        audio_init();
+    /* Material system. */
 
-        /* Initialize the video. */
+    mtrl_init();
 
-        if (video_init())
+    return 1;
+}
+
+/*
+ * Shut down all systems.
+ */
+static void main_quit(void)
+{
+    config_save();
+
+    /* Free everything else. */
+
+    goto_state(&st_null);
+
+    /* Restore Neverputt's camera setting. */
+
+    config_set_d(CONFIG_CAMERA, camera);
+    config_save();
+
+    mtrl_quit();
+    video_quit();
+    audio_free();
+    lang_quit();
+    joy_quit();
+    config_quit();
+    SDL_Quit();
+    log_quit();
+    fs_quit();
+}
+	
+int main(int argc, char *argv[])	
+{
+    struct main_loop mainloop = { 0 };
+
+    struct state *start_state = &st_title;
+
+    if (!main_init(argc, argv))
+        return 1;
+
+    /* Screen states. */
+
+    init_state(&st_null);
+	
+    if (opt_hole)
+    {
+        const char *path = fs_resolve(opt_hole);
+        int loaded = 0;
+
+        if (path)
         {
-            int t1, t0 = SDL_GetTicks();
+            hole_init(NULL);
 
-            /* Material system. */
-
-            mtrl_init();
-
-            /* Run the main game loop. */
-
-            init_state(&st_null);
-
-            if (opt_hole)
+            if (hole_load(0, path) &&
+                hole_load(1, path) &&
+                hole_goto(1, 1))
             {
-                const char *path = fs_resolve(opt_hole);
-                int loaded = 0;
-
-                if (path)
-                {
-                    hole_init(NULL);
-
-                    if (hole_load(0, path) &&
-                        hole_load(1, path) &&
-                        hole_goto(1, 1))
-                    {
-                        goto_state(&st_next);
-                        loaded = 1;
-                    }
-                }
-
-                if (!loaded)
-                    goto_state(&st_title);
+                goto_state(&st_next);
+                loaded = 1;
             }
-            else
-                goto_state(&st_title);
-
-            while (loop())
-                if ((t1 = SDL_GetTicks()) > t0)
-                {
-                    st_timer((t1 - t0) / 1000.f);
-                    hmd_step();
-                    st_paint(0.001f * t1);
-                    video_swap();
-
-                    t0 = t1;
-
-                    if (config_get_d(CONFIG_NICE))
-                        SDL_Delay(1);
-                }
-
-            mtrl_quit();
         }
 
-        /* Restore Neverball's camera setting. */
-
-        config_set_d(CONFIG_CAMERA, camera);
-        config_save();
-
-        joy_quit();
-
-        SDL_Quit();
+        if (!loaded)
+            goto_state(&st_title);
     }
-    else log_printf("Failure to initialize SDL (%s)\n", SDL_GetError());
+    else
+        goto_state(&st_title);
+
+    /* Run the main game loop. */
+
+    mainloop.now = SDL_GetTicks();
+
+#ifdef __EMSCRIPTEN__
+    /*
+     * The Emscripten main loop is asynchronous. In other words,
+     * emscripten_set_main_loop_arg() returns immediately. The fourth
+     * parameter basically just determines what happens with main()
+     * beyond this point:
+     *
+     *   0 = execution continues to the end of main().
+     *   1 = execution stops here, the rest of main() is never executed.
+     *
+     * It's best not to put anything after this.
+     */
+    emscripten_set_main_loop_arg(step, (void *) &mainloop, 0, 1);
+#else
+    while (!mainloop.done)
+        step(&mainloop);
+
+    main_quit();
+#endif
 
     return 0;
 }
 
 /*---------------------------------------------------------------------------*/
-
